@@ -1,140 +1,53 @@
 // ============================================================
-// src/FightState.cpp
+// src/FightState.cpp — 1v1 对战状态实现
 // ============================================================
 #include "FightState.hpp"
 #include "Constants.hpp"
-#include "AssetManager.hpp"
-#include <algorithm>
 
 FightState::FightState(const sf::Font& font)
-    : m_font(font)
-    , m_hudL(font)
-    , m_hudR(font)
-    , m_f1(1, makeMageConfig())
-    , m_f2(2, makeSwordsmanConfig())
-    , m_win(font, "", 48)
+    : BattleState(font)
+    , m_win(font, "", 48) // SFML 3.x Text 必须在初始化列表构造（无默认构造）
 {
     m_win.setFillColor(sf::Color::Yellow);
 }
 
-void FightState::setPlayers(const CharacterConfig& p1, const CharacterConfig& p2) {
-    m_cfg1 = &p1; m_cfg2 = &p2;
-}
-
 void FightState::onEnter() {
-    m_proj.clear(); m_traps.clear(); m_over = false; m_restart = 0.f;
-    initFighters();
+    BattleState::onEnter(); // 父类：清空抛射物/陷阱 + 重建角色
+    m_over    = false;
+    m_restart = 0.f;
 }
 
-void FightState::initFighters() {
-    if (!m_cfg1 || !m_cfg2) return;
-    m_f1 = Fighter(1, *m_cfg1);
-    m_f1.setTexture(AssetManager::getInstance().getTexture(m_cfg1->textureKey));
-    m_f1.setPosition({200.f, Constants::GROUND_Y - 64.f});
-    m_f1.setFacing(1.f);
+// ==================== Hook 覆写 ====================
 
-    m_f2 = Fighter(2, *m_cfg2);
-    m_f2.setTexture(AssetManager::getInstance().getTexture(m_cfg2->textureKey));
-    m_f2.setPosition({600.f, Constants::GROUND_Y - 64.f});
-    m_f2.setFacing(-1.f);
+// preUpdate：本帧是否继续执行战斗逻辑？
+//   KO 前：return true → 正常执行 Fighter 更新 + 碰撞 + HUD
+//   KO 后：只累加倒计时，跳过一切（角色不再动、不再碰撞、HUD 不再刷新）
+bool FightState::preUpdate(float dt) {
+    if (!m_over) return true;
+    m_restart += dt;
+    if (m_restart > Constants::KO_RESTART_DELAY)
+        requestChange(StateID::Select);
+    return false;
 }
 
-void FightState::handleEvent(const sf::Event& event) {
-    const auto* k = event.getIf<sf::Event::KeyPressed>();
-    if (k && k->scancode == sf::Keyboard::Scancode::R) requestChange(StateID::Select);
-}
-
-void FightState::update(float dt) {
-    if (m_over) { m_restart += dt; if (m_restart > 3.f) requestChange(StateID::Select); return; }
-
-    m_f1.handleInput();
-    m_f2.handleInput();
-    m_f1.update(dt, m_f2, m_proj, m_traps);
-    m_f2.update(dt, m_f1, m_proj, m_traps);
-
-    // === 落地推离：双方着地时不能有任何重叠 ===
-    if (m_f1.isOnGround() && m_f2.isOnGround()) {
-        auto ov = m_f1.getHurtbox().findIntersection(m_f2.getHurtbox());
-        if (ov) {
-            float dx = ov->size.x * 0.5f;
-            sf::Vector2f p1 = m_f1.getPosition();
-            sf::Vector2f p2 = m_f2.getPosition();
-            if (p1.x < p2.x) {
-                p1.x -= dx; p2.x += dx;
-            } else {
-                p1.x += dx; p2.x -= dx;
-            }
-            p1.x = std::clamp(p1.x, 0.f, Constants::WINDOW_WIDTH - 64.f);
-            p2.x = std::clamp(p2.x, 0.f, Constants::WINDOW_WIDTH - 64.f);
-            m_f1.setPosition(p1);
-            m_f2.setPosition(p2);
-        }
-    }
-
-    tickProjectiles(dt);
-    tickTraps(dt);
+void FightState::postFighterUpdate(float /*dt*/) {
     checkWin();
-    refreshHUD();
 }
 
-void FightState::tickProjectiles(float dt) {
-    for (auto& p : m_proj) p.update(dt);
-    for (auto& p : m_proj) {
-        if (p.isDead()) continue;
-        // 只检测与发射者之外的玩家碰撞
-        if (p.getOwner() != 1 && p.getBounds().findIntersection(m_f1.getHurtbox()))
-            { m_f1.takeDamage(p.getDamage()); p.kill(); }
-        if (p.getOwner() != 2 && p.getBounds().findIntersection(m_f2.getHurtbox()))
-            { m_f2.takeDamage(p.getDamage()); p.kill(); }
-    }
-    m_proj.erase(std::remove_if(m_proj.begin(), m_proj.end(),
-                 [](const Projectile& p){ return p.isDead(); }), m_proj.end());
+void FightState::drawExtras(sf::RenderWindow& window) {
+    if (m_over) window.draw(m_win);
 }
 
-void FightState::tickTraps(float dt) {
-    for (auto& t : m_traps) t.update(dt);
-    for (auto& t : m_traps) {
-        if (t.isExpired() || t.isTriggered()) continue;
-        if (t.getOwner() != 1 && t.getBounds().findIntersection(m_f1.getHurtbox())) {
-            m_f1.applyDot(t.getDotDamage(), t.getDotInterval(), t.getDotDuration());
-            m_f1.applySlow(t.getSlowAmount(), t.getSlowDuration());
-            t.trigger();
-        }
-        if (t.getOwner() != 2 && t.getBounds().findIntersection(m_f2.getHurtbox())) {
-            m_f2.applyDot(t.getDotDamage(), t.getDotInterval(), t.getDotDuration());
-            m_f2.applySlow(t.getSlowAmount(), t.getSlowDuration());
-            t.trigger();
-        }
-    }
-    m_traps.erase(std::remove_if(m_traps.begin(), m_traps.end(),
-                  [](const Trap& t){ return t.isExpired(); }), m_traps.end());
-}
+// ==================== KO 判定 ====================
 
 void FightState::checkWin() {
     if (m_f1.isKO() || m_f2.isKO()) {
         m_over = true;
+        // 如果 P1 死了 → P2 胜；否则 P1 胜
         m_win.setString((m_f1.isKO() ? m_f2.getName() : m_f1.getName()) + " WINS!");
+        // 文字居中：先获取文字的实际像素大小，设 origin 为中心，再移到屏幕中央
         sf::FloatRect b = m_win.getLocalBounds();
         m_win.setOrigin({b.size.x / 2.f, b.size.y / 2.f});
         m_win.setPosition({Constants::WINDOW_WIDTH / 2.f, Constants::WINDOW_HEIGHT / 2.f});
     }
-}
-
-void FightState::refreshHUD() {
-    m_hudL.update(m_f1.getHp(), m_f1.getMaxHp(), m_f1.getMp(), m_f1.getMaxMp(),
-                  m_f1.getName(), m_f1.getAtkCD(), m_f1.getAtkCDMax(),
-                  m_f1.getSk1CD(), m_f1.getSk1CDMax(), m_f1.getSk2CD(), m_f1.getSk2CDMax(), true);
-    m_hudR.update(m_f2.getHp(), m_f2.getMaxHp(), m_f2.getMp(), m_f2.getMaxMp(),
-                  m_f2.getName(), m_f2.getAtkCD(), m_f2.getAtkCDMax(),
-                  m_f2.getSk1CD(), m_f2.getSk1CDMax(), m_f2.getSk2CD(), m_f2.getSk2CDMax(), false);
-}
-
-void FightState::draw(sf::RenderWindow& window) {
-    m_map.drawBackground(window);
-    m_map.drawGround(window);
-    for (auto& p : m_proj) p.draw(window);
-    for (auto& t : m_traps) t.draw(window);
-    m_f1.draw(window); m_f2.draw(window);
-    m_hudL.draw(window); m_hudR.draw(window);
-    if (m_over) window.draw(m_win);
 }
